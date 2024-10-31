@@ -1,2 +1,6 @@
 *.pickle
 *.html
+/venv
+/lib
+/data
+.env

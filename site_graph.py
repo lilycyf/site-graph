@@ -9,12 +9,30 @@ import pickle
 import scipy
 import numpy as np
 
+
+import os
+import random
+import string
+
+from pydantic import BaseModel
+from openai import OpenAI
+
 from collections import deque
+
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+api_key = os.getenv('OPENAI_API_KEY')
 
 INTERNAL_COLOR = '#0072BB'
 EXTERNAL_COLOR = '#FF9F40'
 ERROR_COLOR = '#FF0800'
 RESOURCE_COLOR = '#2ECC71'
+
+NOT_VISITED_COLOR = 'gray'
+
 
 
 def handle_error(error, error_obj, r, url, visited, error_codes):
@@ -27,13 +45,69 @@ def handle_error(error, error_obj, r, url, visited, error_codes):
 def has_been_visited(url, visited):
     return url in visited or url.rstrip('/') in visited or url + '/' in visited
 
+def handle_page_text(page):
+    # Parse the HTML content using BeautifulSoup
+    soup = BeautifulSoup(page.content, 'html.parser')
 
-def crawl(url, visit_external, keep_queries):
+    # Remove unwanted elements
+    # Remove the header section
+    for header in soup.find_all(['header', 'nav', 'div'], {'class': ['header', 'nav', 'site-header', 'top-header']}):
+        header.decompose()
+
+    # Remove the footer section
+    for footer in soup.find_all(['footer', 'div'], {'class': ['footer', 'site-footer', 'bottom-footer']}):
+        footer.decompose()
+
+    # Remove sidebars (common layout elements that are not part of the main content)
+    for sidebar in soup.find_all(['aside', 'div'], {'class': ['sidebar', 'sidebar-content', 'widget']}):
+        sidebar.decompose()
+
+    # Remove advertisements (common ad classes)
+    for ad in soup.find_all(['div', 'section', 'iframe'], {'class': ['ad', 'adsbygoogle', 'advertisement']}):
+        ad.decompose()
+
+    # Remove any script or style elements
+    for script in soup(['script', 'style']):
+        script.decompose()
+
+    # Get text from the remaining content, preserving newlines
+    page_text = soup.get_text(separator='\n')
+
+    # Clean up excessive whitespace while keeping each line separate
+    cleaned_text = '\n'.join(line.strip() for line in page_text.splitlines() if line.strip())
+
+    # Return the final cleaned text
+    return cleaned_text
+
+
+
+def crawl(url, visit_external, keep_queries, args, filter=False):
     visited = set()
-    edges = set()
+    edges_with_labels = {}  # Dictionary to store edges with labels
     resource_pages = set()
     error_codes = dict()
     redirect_target_url = dict()
+    all_text = ""
+
+    # Folder setup
+    target_folder = 'data/'
+
+    # Generate random ID and check if folder exists
+    while True:
+        random_id = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
+        folder_path = os.path.join(target_folder, random_id)
+        if not os.path.exists(folder_path):
+            os.makedirs(folder_path)
+            break
+    
+    screenshot_folder = os.path.join(folder_path, 'screenshot')
+    html_folder = os.path.join(folder_path, 'html')
+
+    if not os.path.exists(screenshot_folder):
+        os.makedirs(screenshot_folder)
+    if not os.path.exists(html_folder):
+        os.makedirs(html_folder)
+
 
     head = requests.head(url, timeout=10)
     site_url = head.url
@@ -51,6 +125,40 @@ def crawl(url, visit_external, keep_queries):
         error_obj = None
         try:
             page = requests.get(url, timeout=10)
+            # Collect text content
+            page_text = handle_page_text(page)
+            text = f"==============================\nURL: {url}\n------------------------------\nContent: {page_text}\n==============================\n"
+
+            all_text += text
+
+            full_path = os.path.join(screenshot_folder, 'screenshot.png')
+
+            # Check if file exists, if it does, append a number to the filename
+            if os.path.exists(full_path):
+                counter = 1
+                while os.path.exists(os.path.join(screenshot_folder, f'screenshot{counter}.png')):
+                    counter += 1
+                full_path = os.path.join(screenshot_folder, f'screenshot{counter}.png')
+
+            take_full_screenshot(url, full_path)
+            print(f"Full-page screenshot saved as {full_path}")
+
+
+            full_path = os.path.join(html_folder, "html.html")
+
+            # Check if file exists, if it does, append a number to the filename
+            if os.path.exists(full_path):
+                counter = 1
+                while os.path.exists(os.path.join(html_folder, f'html{counter}.html')):
+                    counter += 1
+                full_path = os.path.join(html_folder, f'html{counter}.html')
+
+            html = page.text
+            with open(full_path, 'w', encoding='utf-8') as file:
+                file.write(html)
+            print(f"HTML content saved to {full_path}")
+
+
         except requests.exceptions.RequestException as e:
             error = True
             error_obj = e
@@ -60,7 +168,7 @@ def crawl(url, visit_external, keep_queries):
             continue
         
         # Don't look for links in external pages
-        if not url.startswith(site_url):
+        if not (visit_external or url.startswith(site_url)):
             continue
 
         soup = BeautifulSoup(page.text, 'html.parser')
@@ -69,7 +177,35 @@ def crawl(url, visit_external, keep_queries):
         base_url = soup.find('base')
         base_url = '' if base_url is None else base_url.get('href', '')
 
-        for link in soup.find_all('a', href=True):
+        to_visit_edges_temp = {}
+        link_list = soup.find_all('a', href=True)
+
+        for link in link_list:
+            link_url = link['href']
+            link_text = link.get_text(strip=True)  # Get the text of the link
+
+            # Get the raw HTML content of the page
+            raw_html = str(soup)
+
+            # Find the position of the link in the raw HTML
+            link_html = str(link)  # Convert the link object to a string (HTML of the <a> tag)
+            link_pos = raw_html.find(link_html)  # Find the position of the link in the raw HTML
+
+            # Get 100 characters before and after the link, ensuring bounds are within the string
+            start_pos = max(0, link_pos - 100)  # Ensure start_pos is not negative
+            end_pos = min(len(raw_html), link_pos + len(link_html) + 100)  # Ensure end_pos is within bounds
+
+            # Extract the surrounding text
+            surrounding_text = raw_html[start_pos:end_pos]
+            
+            to_visit_edges_temp[(url, link_url)] = (link_text, surrounding_text) or ("No Label", surrounding_text)
+
+        
+        if filter:
+            link_list = filter_edges(to_visit_edges_temp, args, link_list)
+
+
+        for link in link_list:
             link_url = link['href']
 
             if link_url.startswith('mailto:'):
@@ -80,7 +216,7 @@ def crawl(url, visit_external, keep_queries):
                 link_url = urllib.parse.urljoin(url, urllib.parse.urljoin(base_url, link_url))
 
             # Remove queries/fragments from internal links
-            if not keep_queries and link_url.startswith(site_url):
+            if not keep_queries and (visit_external or link_url.startswith(site_url)):
                 link_url = urllib.parse.urljoin(link_url, urllib.parse.urlparse(link_url).path)
 
             # Load where we know that link_url will be redirected
@@ -102,7 +238,7 @@ def crawl(url, visit_external, keep_queries):
 
                 if error or not head:
                     handle_error(error, error_obj, head, link_url, visited, error_codes)
-                    edges.add((url, link_url))
+                    edges_with_labels[(url, link_url)] = (link_text, surrounding_text) or ("No Label", surrounding_text)
                     continue
 
                 visited.add(link_url)
@@ -112,34 +248,177 @@ def crawl(url, visit_external, keep_queries):
                 visited.add(link_url)
 
                 if is_html:
-                    if url.startswith(site_url):
+                    if (visit_external or link_url.startswith(site_url)):
                         to_visit.append((link_url, url))
                 else:
                     resource_pages.add(link_url)
             
-            # print(f'adding edge from {url} to {link_url}')
-            edges.add((url, link_url))
+            # Add edge with label
+            edges_with_labels[(url, link_url)] = (link_text, surrounding_text) or ("No Label", surrounding_text)
+        print(to_visit)
+    
+        
+    with open(os.path.join(folder_path, "output.txt"), "w") as file:
+        # Write the string to the file
+        file.write(all_text)
 
-    return edges, error_codes, resource_pages
+    print(f"Content has been saved to {os.path.join(folder_path, 'output.txt')}")
+
+    return edges_with_labels, error_codes, resource_pages
 
 
-def get_node_info(nodes, error_codes, resource_pages, args):
+def get_node_info(nodes, error_codes, resource_pages, args, visited_pages):
     node_info = []
     for node in nodes:
-        if node in error_codes:
-            node_info.append(f'Error: {error_codes[node]}')
-        elif node in resource_pages:
-            node_info.append('resource')
-        elif node.startswith(args.site_url):
-            node_info.append('internal')
+        if node in visited_pages:
+            if node in error_codes:
+                node_info.append(f'Error: {error_codes[node]}; visited')
+            elif node in resource_pages:
+                node_info.append('resource; visited')
+            elif node.startswith(args.site_url):
+                node_info.append('internal; visited')
+            else:
+                node_info.append('external; visited')
         else:
-            node_info.append('external')
+            if node in error_codes:
+                node_info.append(f'Error: {error_codes[node]}')
+            elif node in resource_pages:
+                node_info.append('resource')
+            elif node.startswith(args.site_url):
+                node_info.append('internal')
+            else:
+                node_info.append('external')
     return node_info
 
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
+import time
 
-def visualize(edges, error_codes, resource_pages, args):
+# Function to capture full-page screenshot
+def take_full_screenshot(url, file_name):
+    # Set up Chrome options
+    chrome_options = webdriver.ChromeOptions()
+    chrome_options.add_argument("--headless")  # Optional: run Chrome in headless mode
+    
+    # Create a WebDriver instance
+    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+    
+    # Open the webpage
+    driver.get(url)
+    
+    # Give time for the page to fully load
+    time.sleep(3)
+    
+    # Set the window size to the width and the full height of the page
+    total_height = driver.execute_script("return document.body.scrollHeight")
+    total_width = driver.execute_script("return document.body.scrollWidth")
+    
+    driver.set_window_size(total_width, total_height)
+    
+    # Take the screenshot
+    driver.save_screenshot(file_name)
+    
+    # Close the browser
+    driver.quit()
+
+
+
+class need_visited(BaseModel):
+    output: list[str]
+
+
+def filter_edges(edges_with_labels, args, link_list):
+
+    # Start by iterating over each edge
+    info_lst = [info for _, info in edges_with_labels.items()]
+    edge_lst = [edge for edge, _ in edges_with_labels.items()]
+
+    client = OpenAI(api_key=api_key)
+
+    # Collect text content
+    page = requests.get(args.site_url, timeout=10)
+    page_text = handle_page_text(page)
+
+    client = OpenAI(api_key=api_key)
+    completion = client.beta.chat.completions.parse(
+        model="gpt-4o-2024-08-06",
+        messages=[
+            {"role": "system", "content": "You are a summary assistant, and you will make a summary based on the text extract from a HTML file provided by the user."},
+            {"role": "user", "content": page_text}
+        ],
+    )
+
+    summary = completion.choices[0].message.parsed
+
+    question = "information of the product of this company"
+
+    # question = "information of a company called Bellabeat"
+
+    client = OpenAI(api_key=api_key)
+    completion = client.beta.chat.completions.parse(
+        model="gpt-4o-2024-08-06",
+        messages=[
+            {"role": "system", "content": "You are a smart crawler assistant, and users will give you a question and a list of pairs. The first item in each pair of the list represents the link_text of a link, and the second item represents the rounding_text of the link. You need to select between: 'Yes', 'No', 'Not Sure' on whether this link might able to contain the information that can answer the question. You need to return a list of equal length to the list provided by the user."},
+            {"role": "user", "content": f"Question: {question}\n\nLink Pairs: {info_lst}"}
+        ],
+        response_format=need_visited,
+    )
+
+    output = completion.choices[0].message.parsed
+    print(output)
+
+    # want_visit_edge = [edge for edge, score in zip(edge_lst, output.output) if score == 'Yes']
+    want_visit_edge = [link for link, score in zip(link_list, output.output) if score == 'Yes']
+
+    return want_visit_edge
+
+
+
+def collect_info_from_url(url):
+    print('Visiting', url)
+    page = requests.get(url, timeout=10)
+    # Collect text content
+    page_text = handle_page_text(page)
+    text = f"==============================\nURL: {url}\n------------------------------\nContent: {page_text}\n==============================\n"
+    html = page.text
+
+    return text, html
+
+
+def collect_info_from_urls(url_lst):
+    all_text = ""
+    # Now, go over each visited page 
+    for i, url in enumerate(url_lst):
+        text, html = collect_info_from_url(url)
+
+        all_text += text
+
+        screenshot_filename = f"screenshot/screenshot_{i}.png"
+        take_full_screenshot(url, screenshot_filename)
+        print(f"Full-page screenshot saved as {screenshot_filename}")
+
+        html_filename = f"html/html_{i}.html"
+        with open(html_filename, 'w', encoding='utf-8') as file:
+            file.write(html)
+        print(f"HTML content saved to {html_filename}")
+
+        
+    with open("output.txt", "w") as file:
+        # Write the string to the file
+        file.write(all_text)
+
+    print("Content has been saved to output.txt")
+
+
+
+def visualize(edges_with_labels, error_codes, resource_pages, args, visited_pages=-1):
     G = nx.DiGraph()
-    G.add_edges_from(edges)
+
+    # Add edges with labels to the graph
+    for (u, v), (link_text, surrounding_text) in edges_with_labels.items():
+        label = link_text
+        G.add_edge(u, v, label=label)
 
     # Contract any extra nodes 
     nodes = set(G.nodes)
@@ -160,13 +439,15 @@ def visualize(edges, error_codes, resource_pages, args):
             base_fname = args.save_txt.replace('.txt', '')
             np.savetxt(args.save_txt, adj_matrix, fmt='%d')
 
-        node_info = get_node_info(nodes, error_codes, resource_pages, args)
+        node_info = get_node_info(nodes, error_codes, resource_pages, args, []) if visited_pages == -1 else get_node_info(nodes, error_codes, resource_pages, args, visited_pages)
         with open(base_fname + '_nodes.txt', 'w') as f:
             f.write('\n'.join([nodes[i] + '\t' + node_info[i] for i in range(len(nodes))]))
 
+    # Create a pyvis network graph
     net = Network(width=args.width, height=args.height, directed=True)
     net.from_nx(G)
 
+    # Apply button settings or load options if provided
     if args.show_buttons:
         net.show_buttons()
     elif args.options is not None:
@@ -178,6 +459,7 @@ def visualize(edges, error_codes, resource_pages, args):
         except Exception as e:
             print('Error applying options:', e)
 
+    # Customize nodes based on error codes, site URLs, and other criteria
     for node in net.nodes:
         node['size'] = 15
         node['label'] = ''
@@ -187,20 +469,34 @@ def visualize(edges, error_codes, resource_pages, args):
                 node['color'] = RESOURCE_COLOR
         else:
             node['color'] = EXTERNAL_COLOR
+        
+        if visited_pages != -1 and node['id'] not in visited_pages:
+            node['color'] = NOT_VISITED_COLOR
 
         if node['id'] in error_codes:
             node['title'] = f'{error_codes[node["id"]]} Error: <a href="{node["id"]}">{node["id"]}</a>'
-            
+
             if not args.only_404 or error_codes[node['id']] == 404:
                 node['color'] = ERROR_COLOR
         else:
             node['title'] = f'<a href="{node["id"]}">{node["id"]}</a>'
     
+    # Add edge labels
+    for edge in net.edges:
+        u, v = edge['from'], edge['to']
+        edge_label = G.edges[u, v].get('label', '')
+        edge['title'] = edge_label  # Add edge label as the title
+
     # Remove saved contractions (otherwise save_graph crashes)
     for edge in net.edges:
         edge.pop('contraction', None)
 
-    net.save_graph(args.vis_file)
+    # Save the graph to file
+    if visited_pages == -1:
+        net.save_graph(args.vis_file)
+    else:
+        net.save_graph(args.vis_file_visited)
+
 
 
 if __name__ == '__main__':
@@ -209,11 +505,13 @@ if __name__ == '__main__':
 
     # Defaults
     vis_file = 'site.html'
+    vis_file_visited = 'site_visited.html'
     data_file = 'crawl.pickle'
     width = 1000
     height = 800
 
     parser.add_argument('--vis-file', type=str, help=f'filename in which to save HTML graph visualization (default: {vis_file})', default=vis_file)
+    parser.add_argument('--vis-file-visited', type=str, help=f'filename in which to save HTML graph visualization with site visited (default: {vis_file_visited})', default=vis_file_visited)
     parser.add_argument('--data-file', type=str, help=f'filename in which to save crawled graph data (default: {data_file})', default=data_file)
     parser.add_argument('--width', type=int, help=f'width of graph visualization in pixels (default: {width})', default=width)
     parser.add_argument('--height', type=int, help=f'height of graph visualization in pixels (default: {height})', default=height)
@@ -235,7 +533,7 @@ if __name__ == '__main__':
                 print('Warning: not using https. If you really want to use http, run with --force')
                 exit(1)
 
-        edges, error_codes, resource_pages = crawl(args.site_url, args.visit_external, args.keep_queries)
+        edges, error_codes, resource_pages = crawl(args.site_url, args.visit_external, args.keep_queries, args, True)
         print('Crawl complete.')
 
         with open(args.data_file, 'wb') as f:
@@ -247,4 +545,6 @@ if __name__ == '__main__':
             args.site_url = site_url
 
     visualize(edges, error_codes, resource_pages, args)
+    # url_lst = filter_edges(edges, args)
+    # visualize(edges, error_codes, resource_pages, args, url_lst)
     print('Saved graph to', args.vis_file)
