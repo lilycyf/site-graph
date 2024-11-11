@@ -81,7 +81,7 @@ def handle_page_text(page):
 
 
 
-def crawl(url, visit_external, keep_queries, args, filter, question):
+def crawl(url, visit_external, keep_queries, filter, question):
     visited = set()
     edges_with_labels = {}  # Dictionary to store edges with labels
     resource_pages = set()
@@ -204,7 +204,7 @@ def crawl(url, visit_external, keep_queries, args, filter, question):
 
         
         if filter:
-            link_list = filter_edges(to_visit_edges_temp, args, link_list, question)
+            link_list = filter_edges(to_visit_edges_temp, link_list, question)
 
 
         for link in link_list:
@@ -366,7 +366,7 @@ class need_visited(BaseModel):
     output: list[str]
 
 
-def filter_edges(edges_with_labels, args, link_list, question):
+def filter_edges(edges_with_labels, link_list, question):
 
     # Start by iterating over each edge
     info_lst = [info for _, info in edges_with_labels.items()]
@@ -554,7 +554,7 @@ if __name__ == '__main__':
         # Request a new argument from the terminal
         question = input("Please tell me what question you hope to answer from the information gain from this crawler: ")
 
-        edges, error_codes, resource_pages = crawl(args.site_url, args.visit_external, args.keep_queries, args, True, question)
+        edges, error_codes, resource_pages = crawl(args.site_url, args.visit_external, args.keep_queries, True, question)
         print('Crawl complete.')
 
         with open(args.data_file, 'wb') as f:
