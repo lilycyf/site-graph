@@ -81,7 +81,7 @@ def handle_page_text(page):
 
 
 
-def crawl(url, visit_external, keep_queries, args, filter=False):
+def crawl(url, visit_external, keep_queries, args, filter, question):
     visited = set()
     edges_with_labels = {}  # Dictionary to store edges with labels
     resource_pages = set()
@@ -115,6 +115,8 @@ def crawl(url, visit_external, keep_queries, args, filter=False):
 
     to_visit = deque()
     to_visit.append((site_url, None))
+
+    counter = 0
 
     while to_visit:
         url, from_url = to_visit.pop()
@@ -202,7 +204,7 @@ def crawl(url, visit_external, keep_queries, args, filter=False):
 
         
         if filter:
-            link_list = filter_edges(to_visit_edges_temp, args, link_list)
+            link_list = filter_edges(to_visit_edges_temp, args, link_list, question)
 
 
         for link in link_list:
@@ -256,6 +258,32 @@ def crawl(url, visit_external, keep_queries, args, filter=False):
             # Add edge with label
             edges_with_labels[(url, link_url)] = (link_text, surrounding_text) or ("No Label", surrounding_text)
         print(to_visit)
+        counter += 1
+
+        # Check if have enough information to answer the question
+        if len(to_visit) != 0 and counter % 3 == 0:
+            
+            client = OpenAI(api_key=api_key)
+            completion = client.beta.chat.completions.parse(
+                model="gpt-4o-2024-08-06",
+                messages=[
+                    {"role": "system", "content": "Please answer the question based on the reference information"},
+                    {"role": "user", "content": f"Question: {question}\n\nReference: {all_text}"}
+                ]
+            )
+
+            output = completion.choices[0].message.content
+            print(output)
+            while True:
+                satisfy = input(f"Are you satisfied with the current answer to your question: '{question}'? If no, we will look for more information. (Y/N): ").strip().upper()
+                if satisfy != "Y" and satisfy != "N":
+                    print("Invalid input. Please enter 'Y' or 'N'.")
+                else:
+                    break
+            if satisfy == "Y":
+                break
+            elif satisfy == "N":
+                pass
     
         
     with open(os.path.join(folder_path, "output.txt"), "w") as file:
@@ -295,28 +323,38 @@ from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 import time
 
-# Function to capture full-page screenshot
-def take_full_screenshot(url, file_name):
+def take_full_screenshot(url, file_name, max_scrolls=20):
     # Set up Chrome options
     chrome_options = webdriver.ChromeOptions()
-    chrome_options.add_argument("--headless")  # Optional: run Chrome in headless mode
+    chrome_options.add_argument("--headless")
     
     # Create a WebDriver instance
     driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
-    
-    # Open the webpage
     driver.get(url)
-    
-    # Give time for the page to fully load
-    time.sleep(3)
-    
-    # Set the window size to the width and the full height of the page
+    time.sleep(5)  # Allow the page to load completely
+
+    # Determine the total height by scrolling
+    scroll_height = driver.execute_script("return window.innerHeight")
     total_height = driver.execute_script("return document.body.scrollHeight")
-    total_width = driver.execute_script("return document.body.scrollWidth")
-    
-    driver.set_window_size(total_width, total_height)
-    
-    # Take the screenshot
+    previous_height = 0
+    scroll_count = 0
+    new_content_loaded = True
+
+    while new_content_loaded and scroll_count < max_scrolls:
+        # Scroll to the bottom of the current visible portion
+        driver.execute_script(f"window.scrollTo(0, {scroll_count * scroll_height});")
+        time.sleep(3)  # Wait for potential content loading
+
+        # Check if new content was loaded by comparing heights
+        current_height = driver.execute_script("return document.body.scrollHeight")
+        new_content_loaded = current_height > total_height
+        total_height = current_height if new_content_loaded else total_height
+        scroll_count += 1
+
+    # Set the window size to the full page height
+    driver.set_window_size(driver.execute_script("return document.body.scrollWidth"), total_height)
+
+    # Take a single full-page screenshot
     driver.save_screenshot(file_name)
     
     # Close the browser
@@ -328,32 +366,12 @@ class need_visited(BaseModel):
     output: list[str]
 
 
-def filter_edges(edges_with_labels, args, link_list):
+def filter_edges(edges_with_labels, args, link_list, question):
 
     # Start by iterating over each edge
     info_lst = [info for _, info in edges_with_labels.items()]
-    edge_lst = [edge for edge, _ in edges_with_labels.items()]
+    # edge_lst = [edge for edge, _ in edges_with_labels.items()]
 
-    client = OpenAI(api_key=api_key)
-
-    # Collect text content
-    page = requests.get(args.site_url, timeout=10)
-    page_text = handle_page_text(page)
-
-    client = OpenAI(api_key=api_key)
-    completion = client.beta.chat.completions.parse(
-        model="gpt-4o-2024-08-06",
-        messages=[
-            {"role": "system", "content": "You are a summary assistant, and you will make a summary based on the text extract from a HTML file provided by the user."},
-            {"role": "user", "content": page_text}
-        ],
-    )
-
-    summary = completion.choices[0].message.parsed
-
-    question = "information of the product of this company"
-
-    # question = "information of a company called Bellabeat"
 
     client = OpenAI(api_key=api_key)
     completion = client.beta.chat.completions.parse(
@@ -532,8 +550,11 @@ if __name__ == '__main__':
             if not args.force:
                 print('Warning: not using https. If you really want to use http, run with --force')
                 exit(1)
+        
+        # Request a new argument from the terminal
+        question = input("Please tell me what question you hope to answer from the information gain from this crawler: ")
 
-        edges, error_codes, resource_pages = crawl(args.site_url, args.visit_external, args.keep_queries, args, True)
+        edges, error_codes, resource_pages = crawl(args.site_url, args.visit_external, args.keep_queries, args, True, question)
         print('Crawl complete.')
 
         with open(args.data_file, 'wb') as f:
